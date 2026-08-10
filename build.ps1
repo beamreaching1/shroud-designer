@@ -21,8 +21,12 @@ $SelfTestReport = Join-Path $ProjectRoot "packaged-self-test-windows.json"
 if (Test-Path -LiteralPath $SelfTestReport) {
     Remove-Item -LiteralPath $SelfTestReport
 }
-& $AppExecutable --self-test $SelfTestReport
-$SelfTestExitCode = $LASTEXITCODE
+$SelfTestProcess = Start-Process `
+    -FilePath $AppExecutable `
+    -ArgumentList @("--self-test", ('"{0}"' -f $SelfTestReport)) `
+    -Wait `
+    -PassThru
+$SelfTestExitCode = $SelfTestProcess.ExitCode
 if (-not (Test-Path -LiteralPath $SelfTestReport)) {
     throw "Packaged self-test did not create a report (exit code $SelfTestExitCode)."
 }
