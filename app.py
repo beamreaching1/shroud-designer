@@ -14,21 +14,23 @@ def resource_path(relative: str) -> Path:
 
 def self_test(report_path: Path) -> int:
     """Exercise packaged STL loading, generation, booleans, and native extensions."""
-    # Keep this path free of PySide6/OpenGL so frozen --self-test can run headless.
-    from shroud_designer.geometry import (
-        ConnectorStackConfig,
-        FanConfig,
-        FanStackConfig,
-        FunnelConfig,
-        analyze_connector,
-        analyze_fan,
-        build_assembly_parts,
-        mesh_component_count,
-        union_assembly,
-    )
-
     report: dict[str, object]
     try:
+        # Keep this path free of PySide6/OpenGL so frozen --self-test can run headless.
+        # Import inside the guarded block so frozen-build import failures reach the
+        # JSON report instead of disappearing behind a windowed executable.
+        from shroud_designer.geometry import (
+            ConnectorStackConfig,
+            FanConfig,
+            FanStackConfig,
+            FunnelConfig,
+            analyze_connector,
+            analyze_fan,
+            build_assembly_parts,
+            mesh_component_count,
+            union_assembly,
+        )
+
         connector = analyze_connector(
             resource_path("GPU Connectors/cmp front.stl")
         )
@@ -143,6 +145,7 @@ def self_test(report_path: Path) -> int:
     except Exception as exc:  # pragma: no cover - only used against packaged build
         report = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         code = 1
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return code
 

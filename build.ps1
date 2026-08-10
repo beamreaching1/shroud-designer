@@ -18,9 +18,16 @@ python -m PyInstaller --noconfirm --clean ShroudDesigner.spec
 $AppDirectory = Join-Path $ProjectRoot "dist\ShroudDesigner"
 $AppExecutable = Join-Path $AppDirectory "ShroudDesigner.exe"
 $SelfTestReport = Join-Path $ProjectRoot "packaged-self-test-windows.json"
+if (Test-Path -LiteralPath $SelfTestReport) {
+    Remove-Item -LiteralPath $SelfTestReport
+}
 & $AppExecutable --self-test $SelfTestReport
+$SelfTestExitCode = $LASTEXITCODE
+if (-not (Test-Path -LiteralPath $SelfTestReport)) {
+    throw "Packaged self-test did not create a report (exit code $SelfTestExitCode)."
+}
 $SelfTest = Get-Content -LiteralPath $SelfTestReport -Raw | ConvertFrom-Json
-if (-not $SelfTest.ok) {
+if ($SelfTestExitCode -ne 0 -or -not $SelfTest.ok) {
     throw "Packaged self-test failed: $($SelfTest | ConvertTo-Json -Compress)"
 }
 Write-Host "Packaged self-test OK"
