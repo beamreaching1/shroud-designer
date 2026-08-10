@@ -41,6 +41,8 @@ a = Analysis(
         (str(project / "assets" / "shroud-designer.ico"), "assets"),
         (str(project / "assets" / "shroud-designer.png"), "assets"),
         (str(project / "assets" / "shroud-designer.svg"), "assets"),
+        (str(project / "assets" / "spin-up.svg"), "assets"),
+        (str(project / "assets" / "spin-down.svg"), "assets"),
         *opengl_datas,
     ],
     hiddenimports=hidden,

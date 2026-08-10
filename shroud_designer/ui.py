@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -61,6 +61,27 @@ def app_icon_path() -> Path:
     return png
 
 
+class _PanelComboBox(QComboBox):
+    """Let the control-panel scroll area own the wheel unless the popup is open."""
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        event.ignore()
+
+
+class _PanelSpinBox(QSpinBox):
+    """Prevent accidental integer changes while scrolling the control panel."""
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        event.ignore()
+
+
+class _PanelDoubleSpinBox(QDoubleSpinBox):
+    """Prevent accidental decimal changes while scrolling the control panel."""
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        event.ignore()
+
+
 def _spin(
     minimum: float,
     maximum: float,
@@ -69,7 +90,7 @@ def _spin(
     decimals: int = 1,
     step: float = 1.0,
 ) -> QDoubleSpinBox:
-    spin = QDoubleSpinBox()
+    spin = _PanelDoubleSpinBox()
     spin.setRange(minimum, maximum)
     spin.setDecimals(decimals)
     spin.setSingleStep(step)
@@ -183,24 +204,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.gpu_info)
 
         opening_form = QFormLayout()
-        self.opening_combo = QComboBox()
+        self.opening_combo = _PanelComboBox()
         self.opening_combo.setEnabled(False)
         self.opening_combo.setToolTip(
             "Auto selects the largest enclosed loop just below the model's highest Z layer."
         )
         opening_form.addRow("Top opening", self.opening_combo)
-        self.connector_count = QSpinBox()
+        self.connector_count = _PanelSpinBox()
         self.connector_count.setRange(1, 10)
         self.connector_count.setValue(1)
         self.connector_count.setKeyboardTracking(False)
-        self.stack_axis = QComboBox()
+        self.stack_axis = _PanelComboBox()
         self.stack_axis.addItem("Y axis", "y")
         self.stack_axis.addItem("X axis", "x")
         self.connector_spacing = _spin(0.0, 500.0, 10.0, decimals=1, step=5.0)
         self.connector_spacing.setToolTip(
             "Clear gap between the outside bounding boxes of adjacent connector copies."
         )
-        self.gpu_bridge = QComboBox()
+        self.gpu_bridge = _PanelComboBox()
         self.gpu_bridge.addItem("Unbridged", "unbridged")
         self.gpu_bridge.addItem("Full length", "full")
         self.gpu_bridge.addItem("Front (funnel end)", "front")
@@ -223,22 +244,22 @@ class MainWindow(QMainWindow):
         group = QGroupBox("2   FAN CONNECTOR")
         layout = QVBoxLayout(group)
         mode_form = QFormLayout()
-        self.fan_mode = QComboBox()
+        self.fan_mode = _PanelComboBox()
         self.fan_mode.addItem("Custom fan plate", "custom")
         self.fan_mode.addItem("Import fan STL", "import")
         mode_form.addRow("Source", self.fan_mode)
-        self.fan_count = QSpinBox()
+        self.fan_count = _PanelSpinBox()
         self.fan_count.setRange(1, 4)
         self.fan_count.setValue(1)
         self.fan_count.setKeyboardTracking(False)
-        self.fan_stack_axis = QComboBox()
+        self.fan_stack_axis = _PanelComboBox()
         self.fan_stack_axis.addItem("Y axis", "y")
         self.fan_stack_axis.addItem("X axis", "x")
         self.fan_spacing = _spin(0.0, 500.0, 10.0, decimals=1, step=5.0)
         self.fan_spacing.setToolTip(
             "Clear gap between the outside bounding boxes of adjacent fan plates."
         )
-        self.fan_bridge = QComboBox()
+        self.fan_bridge = _PanelComboBox()
         self.fan_bridge.addItem("Unbridged", False)
         self.fan_bridge.addItem("Fully bridged", True)
         mode_form.addRow("Fan count", self.fan_count)
@@ -261,7 +282,7 @@ class MainWindow(QMainWindow):
         self.custom_fan_widget = QWidget()
         custom_form = QFormLayout(self.custom_fan_widget)
         custom_form.setContentsMargins(0, 0, 0, 0)
-        self.fan_size = QComboBox()
+        self.fan_size = _PanelComboBox()
         self.fan_size.addItem("120 mm", 120.0)
         self.fan_size.addItem("140 mm", 140.0)
         self.fan_hole = _spin(20.0, 200.0, 116.0, decimals=1, step=1.0)
@@ -282,7 +303,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
         common = QFormLayout()
         self.wall = _spin(0.4, 10.0, 1.0, decimals=2, step=0.1)
-        self.funnel_mode = QComboBox()
+        self.funnel_mode = _PanelComboBox()
         self.funnel_mode.addItem("Straight / offset", False)
         self.funnel_mode.addItem("Compound curve", True)
         common.addRow("Wall thickness", self.wall)
@@ -704,6 +725,14 @@ class MainWindow(QMainWindow):
         )
 
 
+def app_stylesheet() -> str:
+    up_arrow = resource_path("assets/spin-up.svg").as_posix()
+    down_arrow = resource_path("assets/spin-down.svg").as_posix()
+    return APP_STYLESHEET.replace("__SPIN_UP__", up_arrow).replace(
+        "__SPIN_DOWN__", down_arrow
+    )
+
+
 APP_STYLESHEET = """
 QMainWindow, QWidget {
     background: #111827;
@@ -731,7 +760,33 @@ QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {
     padding: 6px 7px; min-height: 20px; selection-background-color: #1c8b8b;
 }
 QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus { border-color: #38b9b2; }
-QComboBox::drop-down { border: 0; width: 22px; }
+QComboBox::drop-down {
+    subcontrol-origin: padding; subcontrol-position: top right; width: 24px;
+    background: #29465f; border-left: 1px solid #466784;
+    border-top-right-radius: 4px; border-bottom-right-radius: 4px;
+}
+QComboBox::down-arrow {
+    image: url("__SPIN_DOWN__"); width: 12px; height: 8px;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border; subcontrol-position: top right; width: 24px;
+    background: #29465f; border-left: 1px solid #466784;
+    border-bottom: 1px solid #1d3043; border-top-right-radius: 4px;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border; subcontrol-position: bottom right; width: 24px;
+    background: #29465f; border-left: 1px solid #466784;
+    border-top: 1px solid #1d3043; border-bottom-right-radius: 4px;
+}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover,
+QComboBox::drop-down:hover { background: #386581; }
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url("__SPIN_UP__"); width: 12px; height: 8px;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url("__SPIN_DOWN__"); width: 12px; height: 8px;
+}
 QPushButton {
     background: #26384d; border: 1px solid #38516d; border-radius: 5px;
     padding: 6px 10px; color: #e6eef7;

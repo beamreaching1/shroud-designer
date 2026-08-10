@@ -174,7 +174,7 @@ def main() -> int:
     from PySide6.QtGui import QSurfaceFormat
     from PySide6.QtWidgets import QApplication
 
-    from shroud_designer.ui import APP_STYLESHEET, MainWindow, app_icon_path
+    from shroud_designer.ui import MainWindow, app_icon_path, app_stylesheet
 
     surface = QSurfaceFormat()
     surface.setVersion(2, 1)
@@ -187,7 +187,7 @@ def main() -> int:
     app.setApplicationName("Shroud Designer")
     app.setOrganizationName("ShroudDesigner")
     app.setStyle("Fusion")
-    app.setStyleSheet(APP_STYLESHEET)
+    app.setStyleSheet(app_stylesheet())
     icon = app_icon_path()
     if icon.exists():
         from PySide6.QtGui import QIcon
