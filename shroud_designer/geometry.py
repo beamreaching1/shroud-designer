@@ -72,6 +72,7 @@ class FunnelConfig:
     path_segments: int = 48
     join_overlap: float = 0.30
     split_distance: float = 20.0
+    fan_split_distance: float = 20.0
 
 
 @dataclass(slots=True)
@@ -79,6 +80,16 @@ class ConnectorStackConfig:
     count: int = 1
     axis: str = "y"
     spacing: float = 0.0
+    bridge_mode: str = "unbridged"
+    bridge_thickness: float = 5.0
+
+
+@dataclass(slots=True)
+class FanStackConfig:
+    count: int = 1
+    axis: str = "y"
+    spacing: float = 0.0
+    bridged: bool = False
 
 
 @dataclass(slots=True)
@@ -461,6 +472,125 @@ def _boolean_union(meshes: list[trimesh.Trimesh], description: str) -> trimesh.T
     return result
 
 
+def _validate_stack(
+    count: int,
+    maximum: int,
+    axis: str,
+    spacing: float,
+    description: str,
+) -> None:
+    if not 1 <= count <= maximum:
+        raise GeometryError(f"{description} count must be between 1 and {maximum}.")
+    if axis not in {"x", "y"}:
+        raise GeometryError(f"{description} can only be stacked along X or Y.")
+    if spacing < 0:
+        raise GeometryError(f"{description} spacing cannot be negative.")
+
+
+def _stack_translations(
+    mesh: trimesh.Trimesh,
+    count: int,
+    axis: str,
+    spacing: float,
+) -> list[np.ndarray]:
+    axis_index = 0 if axis == "x" else 1
+    step = float(mesh.extents[axis_index]) + spacing
+    offsets = (np.arange(count, dtype=float) - (count - 1) / 2.0) * step
+    return [
+        np.array(
+            [offset if axis == "x" else 0.0, offset if axis == "y" else 0.0, 0.0],
+            dtype=float,
+        )
+        for offset in offsets
+    ]
+
+
+def _bridge_stacked_meshes(
+    meshes: list[trimesh.Trimesh],
+    base_bounds: np.ndarray,
+    translations: list[np.ndarray],
+    axis: str,
+    mode: str,
+    thickness: float,
+    overlap: float,
+    description: str,
+) -> trimesh.Trimesh:
+    if len(meshes) == 1 or mode == "unbridged":
+        return trimesh.util.concatenate(meshes)
+    if mode not in {"full", "front", "back"}:
+        raise GeometryError(f"Unknown {description.lower()} bridge mode: {mode}.")
+    if mode in {"front", "back"} and thickness <= 0:
+        raise GeometryError(f"{description} bridge thickness must be greater than zero.")
+
+    axis_index = 0 if axis == "x" else 1
+    other_index = 1 - axis_index
+    z_min, z_max = float(base_bounds[0, 2]), float(base_bounds[1, 2])
+    if mode == "front":
+        z_min = max(z_min, z_max - thickness)
+    elif mode == "back":
+        z_max = min(z_max, z_min + thickness)
+
+    contact = max(0.5, overlap)
+    bridges: list[trimesh.Trimesh] = []
+    for first, second in zip(translations, translations[1:]):
+        low = np.array(base_bounds[0], dtype=float)
+        high = np.array(base_bounds[1], dtype=float)
+        low[axis_index] = base_bounds[1, axis_index] + first[axis_index] - contact
+        high[axis_index] = base_bounds[0, axis_index] + second[axis_index] + contact
+        low[other_index] = base_bounds[0, other_index]
+        high[other_index] = base_bounds[1, other_index]
+        low[2], high[2] = z_min, z_max
+        extents = high - low
+        if np.any(extents <= 0):
+            raise GeometryError(f"The {description.lower()} bridge has no printable volume.")
+        transform = trimesh.transformations.translation_matrix((low + high) / 2.0)
+        bridges.append(trimesh.creation.box(extents=extents, transform=transform))
+
+    merged = _boolean_union([*meshes, *bridges], f"the {description.lower()} bridges")
+    merged.remove_unreferenced_vertices()
+    if not merged.is_winding_consistent:
+        merged.fix_normals()
+    if not merged.is_watertight or mesh_component_count(merged) != 1:
+        raise GeometryError(
+            f"The {description.lower()} bridges did not fuse every stacked copy."
+        )
+    return merged
+
+
+def _combined_opening(openings: list[Polygon], description: str) -> Polygon:
+    combined = unary_union(openings).convex_hull
+    if not isinstance(combined, Polygon):
+        raise GeometryError(f"The {description} openings could not be combined.")
+    return orient(combined, sign=1.0)
+
+
+def _reverse_branch(mesh: trimesh.Trimesh, distance: float) -> trimesh.Trimesh:
+    reversed_mesh = mesh.copy()
+    vertices = reversed_mesh.vertices.copy()
+    vertices[:, 2] = distance - vertices[:, 2]
+    reversed_mesh.vertices = vertices
+    reversed_mesh.invert()
+    reversed_mesh.remove_unreferenced_vertices()
+    if not reversed_mesh.is_winding_consistent:
+        reversed_mesh.fix_normals()
+    return reversed_mesh
+
+
+def _place_local_mesh(
+    mesh: trimesh.Trimesh,
+    origin: np.ndarray,
+    basis: np.ndarray,
+    offset: np.ndarray | None = None,
+) -> trimesh.Trimesh:
+    placed = mesh.copy()
+    local = placed.vertices.copy()
+    if offset is not None:
+        local += offset
+    placed.vertices = origin + local @ basis.T
+    placed.remove_unreferenced_vertices()
+    return placed
+
+
 def _make_branch_manifold(
     openings: list[Polygon],
     top_z: float,
@@ -555,6 +685,7 @@ def make_funnel(
     opening: Polygon,
     top_z: float,
     config: FunnelConfig,
+    outlet_polygon: Polygon | None = None,
 ) -> FunnelResult:
     if config.wall_thickness <= 0:
         raise GeometryError("Wall thickness must be greater than zero.")
@@ -573,14 +704,32 @@ def make_funnel(
     base_inner = base_inner_abs - center_2d
     base_outer = base_outer_abs - center_2d
 
-    start_angle = atan2(base_inner[0, 1], base_inner[0, 0])
-    angles = start_angle + np.arange(count, dtype=float) * 2.0 * pi / count
-    outlet_inner = np.column_stack((np.cos(angles), np.sin(angles))) * (
-        config.outlet_diameter / 2.0
-    )
-    outlet_outer = np.column_stack((np.cos(angles), np.sin(angles))) * (
-        config.outlet_diameter / 2.0 + config.wall_thickness
-    )
+    if outlet_polygon is None:
+        start_angle = atan2(base_inner[0, 1], base_inner[0, 0])
+        angles = start_angle + np.arange(count, dtype=float) * 2.0 * pi / count
+        outlet_inner = np.column_stack((np.cos(angles), np.sin(angles))) * (
+            config.outlet_diameter / 2.0
+        )
+        outlet_outer = np.column_stack((np.cos(angles), np.sin(angles))) * (
+            config.outlet_diameter / 2.0 + config.wall_thickness
+        )
+        outlet_radius = config.outlet_diameter / 2.0 + config.wall_thickness
+    else:
+        outlet_polygon = orient(outlet_polygon, sign=1.0)
+        outlet_center_2d = np.asarray(outlet_polygon.centroid.coords[0], dtype=float)
+        centered_outlet = translate_polygon(
+            outlet_polygon,
+            xoff=-float(outlet_center_2d[0]),
+            yoff=-float(outlet_center_2d[1]),
+        )
+        buffered_outlet = centered_outlet.buffer(
+            config.wall_thickness, join_style="round"
+        )
+        if not isinstance(buffered_outlet, Polygon):
+            raise GeometryError("The fan openings cannot be offset into a funnel wall.")
+        outlet_inner = _resample_boundary(centered_outlet, count)
+        outlet_outer = _resample_boundary(buffered_outlet, count, outlet_inner[0])
+        outlet_radius = float(np.max(np.linalg.norm(outlet_outer, axis=1)))
 
     base_center = np.array([center_2d[0], center_2d[1], top_z], dtype=float)
     identity = np.eye(3, dtype=float)
@@ -590,20 +739,20 @@ def make_funnel(
         if config.length <= 0:
             raise GeometryError("Funnel length must be greater than zero.")
         segment_count = max(2, int(config.path_segments))
-        fractions = np.linspace(0.0, 1.0, segment_count + 1)
+        distances = np.linspace(-config.join_overlap, config.length, segment_count + 1)
+        shape_fractions = np.clip(distances / config.length, 0.0, 1.0)
         centers = [
             base_center
             + np.array(
                 [
                     config.offset_x * fraction,
                     config.offset_y * fraction,
-                    -config.join_overlap + (config.length + config.join_overlap) * fraction,
+                    distance,
                 ]
             )
-            for fraction in fractions
+            for distance, fraction in zip(distances, shape_fractions, strict=True)
         ]
         frames = [identity] * len(centers)
-        shape_fractions = fractions
         outlet_center = base_center + np.array(
             [config.offset_x, config.offset_y, config.length], dtype=float
         )
@@ -627,7 +776,7 @@ def make_funnel(
         axis = np.array([-horizontal[1], horizontal[0], 0.0], dtype=float)
         # "Arc diameter" is the free diameter on the inside of the elbow. This keeps
         # a value of zero physically printable and makes larger values progressively gentler.
-        outer_radius = config.outlet_diameter / 2.0 + config.wall_thickness
+        outer_radius = outlet_radius
         bend_radius = outer_radius + max(0.0, config.arc_diameter) / 2.0
         arc_length = bend_radius * theta
         total_length = config.lead_in + arc_length + config.lead_out
@@ -666,9 +815,7 @@ def make_funnel(
             z_axis = _rodrigues(identity[:, 2], axis, local_angle)
             centers.append(center)
             frames.append(np.column_stack((x_axis, y_axis, z_axis)))
-        shape_fractions = (distances + config.join_overlap) / (
-            total_length + config.join_overlap
-        )
+        shape_fractions = np.clip(distances / total_length, 0.0, 1.0)
         outlet_center = bend_end + final_direction * config.lead_out
         outlet_basis = frames[-1]
         centerline_length = total_length
@@ -758,31 +905,60 @@ def build_assembly_parts(
     fan_config: FanConfig | None = None,
     imported_fan: FanAnalysis | None = None,
     stack_config: ConnectorStackConfig | None = None,
+    fan_stack_config: FanStackConfig | None = None,
 ) -> AssemblyParts:
     if (fan_config is None) == (imported_fan is None):
         raise GeometryError("Choose either a custom fan connector or an imported fan STL.")
 
     if imported_fan is not None:
-        funnel_config.outlet_diameter = imported_fan.hole_diameter
+        outlet_diameter = imported_fan.hole_diameter
+        local_fan = imported_fan.mesh.copy()
+        local_hole_center = imported_fan.hole_center
+        local_z_min = imported_fan.z_min
+        fan_opening = translate_polygon(
+            imported_fan.hole_polygon,
+            xoff=-float(local_hole_center[0]),
+            yoff=-float(local_hole_center[1]),
+        )
     else:
         assert fan_config is not None
-        funnel_config.outlet_diameter = fan_config.hole_diameter
+        outlet_diameter = fan_config.hole_diameter
+        local_fan = make_custom_fan(fan_config)
+        local_hole_center = np.array([0.0, 0.0], dtype=float)
+        local_z_min = 0.0
+        fan_opening = Point(0.0, 0.0).buffer(
+            fan_config.hole_diameter / 2.0, quad_segs=48
+        )
+
+    local_vertices = local_fan.vertices.copy()
+    local_vertices[:, 0] -= float(local_hole_center[0])
+    local_vertices[:, 1] -= float(local_hole_center[1])
+    local_vertices[:, 2] -= float(local_z_min)
+    local_fan.vertices = local_vertices
+    local_fan.remove_unreferenced_vertices()
+
+    working_config = replace(funnel_config, outlet_diameter=outlet_diameter)
 
     stack = stack_config or ConnectorStackConfig()
-    if not 1 <= stack.count <= 10:
-        raise GeometryError("GPU connector count must be between 1 and 10.")
-    if stack.axis not in {"x", "y"}:
-        raise GeometryError("GPU connectors can only be stacked along X or Y.")
-    if stack.spacing < 0:
-        raise GeometryError("GPU connector spacing cannot be negative.")
+    _validate_stack(stack.count, 10, stack.axis, stack.spacing, "GPU connector")
+    if stack.bridge_mode not in {"unbridged", "full", "front", "back"}:
+        raise GeometryError(f"Unknown GPU connector bridge mode: {stack.bridge_mode}.")
+    if stack.bridge_mode in {"front", "back"} and stack.bridge_thickness <= 0:
+        raise GeometryError("GPU bridge thickness must be greater than zero.")
 
-    axis_index = 0 if stack.axis == "x" else 1
-    step = float(connector.mesh.extents[axis_index]) + stack.spacing
-    offsets = (np.arange(stack.count, dtype=float) - (stack.count - 1) / 2.0) * step
-    translations = [
-        np.array([offset if stack.axis == "x" else 0.0, offset if stack.axis == "y" else 0.0, 0.0])
-        for offset in offsets
-    ]
+    fan_stack = fan_stack_config or FanStackConfig()
+    _validate_stack(fan_stack.count, 4, fan_stack.axis, fan_stack.spacing, "Fan")
+
+    effective_overlap = (
+        max(1.0, working_config.join_overlap)
+        if stack.count > 1 or fan_stack.count > 1
+        else working_config.join_overlap
+    )
+    working_config = replace(working_config, join_overlap=effective_overlap)
+
+    translations = _stack_translations(
+        connector.mesh, stack.count, stack.axis, stack.spacing
+    )
     gpu_meshes = []
     openings = []
     for translation in translations:
@@ -796,59 +972,134 @@ def build_assembly_parts(
                 yoff=float(translation[1]),
             )
         )
-    gpu_mesh = trimesh.util.concatenate(gpu_meshes)
+    gpu_mesh = _bridge_stacked_meshes(
+        gpu_meshes,
+        connector.mesh.bounds,
+        translations,
+        stack.axis,
+        stack.bridge_mode,
+        stack.bridge_thickness,
+        effective_overlap,
+        "GPU connector",
+    )
 
-    effective_overlap = funnel_config.join_overlap
+    fan_translations = _stack_translations(
+        local_fan, fan_stack.count, fan_stack.axis, fan_stack.spacing
+    )
+    local_fan_meshes: list[trimesh.Trimesh] = []
+    fan_openings: list[Polygon] = []
+    for translation in fan_translations:
+        fan_copy = local_fan.copy()
+        fan_copy.apply_translation(translation)
+        local_fan_meshes.append(fan_copy)
+        fan_openings.append(
+            translate_polygon(
+                fan_opening,
+                xoff=float(translation[0]),
+                yoff=float(translation[1]),
+            )
+        )
+    local_fan_assembly = _bridge_stacked_meshes(
+        local_fan_meshes,
+        local_fan.bounds,
+        fan_translations,
+        fan_stack.axis,
+        "full" if fan_stack.bridged else "unbridged",
+        float(local_fan.extents[2]),
+        effective_overlap,
+        "Fan connector",
+    )
+    outlet_opening = (
+        fan_openings[0]
+        if fan_stack.count == 1
+        else _combined_opening(fan_openings, "fan")
+    )
+
+    funnel_meshes: list[trimesh.Trimesh] = []
+    main_opening = openings[0]
+    main_start_z = connector.top_z
+    gpu_split_length = 0.0
     if stack.count == 1:
-        funnel = make_funnel(openings[0], connector.top_z, funnel_config)
+        pass
     else:
-        if funnel_config.split_distance <= 0:
-            raise GeometryError("Split distance must be greater than zero.")
-        effective_overlap = max(1.0, funnel_config.join_overlap)
-        multi_funnel_config = replace(funnel_config, join_overlap=effective_overlap)
-        split_z = connector.top_z + funnel_config.split_distance
-        branch_mesh, combined_opening = _make_branch_manifold(
+        if working_config.split_distance <= 0:
+            raise GeometryError("GPU split distance must be greater than zero.")
+        gpu_split_length = working_config.split_distance
+        main_start_z = connector.top_z + gpu_split_length
+        gpu_branches, main_opening = _make_branch_manifold(
             openings,
             connector.top_z,
-            split_z,
-            funnel_config.wall_thickness,
-            max(32, int(funnel_config.radial_segments)),
-            max(8, int(funnel_config.path_segments)),
+            main_start_z,
+            working_config.wall_thickness,
+            max(32, int(working_config.radial_segments)),
+            max(8, int(working_config.path_segments)),
             effective_overlap,
         )
-        main_funnel = make_funnel(combined_opening, split_z, multi_funnel_config)
-        funnel_mesh = _boolean_union(
-            [branch_mesh, main_funnel.mesh], "the split manifold and main funnel"
+        funnel_meshes.append(gpu_branches)
+
+    main_funnel = make_funnel(
+        main_opening,
+        main_start_z,
+        working_config,
+        outlet_polygon=outlet_opening,
+    )
+    funnel_meshes.append(main_funnel.mesh)
+
+    fan_split_length = 0.0
+    if fan_stack.count > 1:
+        if working_config.fan_split_distance <= 0:
+            raise GeometryError("Fan split distance must be greater than zero.")
+        fan_split_length = working_config.fan_split_distance
+        fan_branches_local, _ = _make_branch_manifold(
+            fan_openings,
+            0.0,
+            fan_split_length,
+            working_config.wall_thickness,
+            max(32, int(working_config.radial_segments)),
+            max(8, int(working_config.path_segments)),
+            effective_overlap,
         )
-        funnel_mesh.remove_unreferenced_vertices()
-        if not funnel_mesh.is_winding_consistent:
-            funnel_mesh.fix_normals()
-        funnel = FunnelResult(
-            funnel_mesh,
+        fan_branches_local = _reverse_branch(fan_branches_local, fan_split_length)
+        fan_branches = _place_local_mesh(
+            fan_branches_local,
             main_funnel.outlet_center,
             main_funnel.outlet_basis,
-            funnel_config.split_distance + main_funnel.centerline_length,
-            main_funnel.warnings,
         )
-    if imported_fan is not None:
-        fan_mesh = place_fan(
-            imported_fan.mesh,
-            imported_fan.hole_center,
-            imported_fan.z_min,
-            funnel,
-            effective_overlap,
+        funnel_meshes.append(fan_branches)
+
+    funnel_mesh = (
+        funnel_meshes[0]
+        if len(funnel_meshes) == 1
+        else _boolean_union(
+            funnel_meshes, "the GPU branches, main funnel, and fan branches"
         )
-    else:
-        assert fan_config is not None
-        local_fan = make_custom_fan(fan_config)
-        fan_mesh = place_fan(
-            local_fan,
-            np.array([0.0, 0.0]),
-            0.0,
-            funnel,
-            effective_overlap,
-        )
-    return AssemblyParts(gpu_mesh, funnel.mesh, fan_mesh, funnel)
+    )
+    funnel_mesh.remove_unreferenced_vertices()
+    if not funnel_mesh.is_winding_consistent:
+        funnel_mesh.fix_normals()
+    if not funnel_mesh.is_watertight or mesh_component_count(funnel_mesh) != 1:
+        raise GeometryError("The complete funnel is not one watertight solid.")
+
+    fan_mesh = _place_local_mesh(
+        local_fan_assembly,
+        main_funnel.outlet_center,
+        main_funnel.outlet_basis,
+        np.array(
+            [0.0, 0.0, fan_split_length - effective_overlap], dtype=float
+        ),
+    )
+    final_outlet_center = main_funnel.outlet_center + (
+        main_funnel.outlet_basis
+        @ np.array([0.0, 0.0, fan_split_length], dtype=float)
+    )
+    funnel = FunnelResult(
+        funnel_mesh,
+        final_outlet_center,
+        main_funnel.outlet_basis,
+        gpu_split_length + main_funnel.centerline_length + fan_split_length,
+        main_funnel.warnings,
+    )
+    return AssemblyParts(gpu_mesh, funnel_mesh, fan_mesh, funnel)
 
 
 def union_assembly(parts: AssemblyParts) -> trimesh.Trimesh:

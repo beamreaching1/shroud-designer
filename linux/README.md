@@ -1,6 +1,6 @@
 # Shroud Designer for Linux
 
-Portable Linux build of **Shroud Designer 0.2** (x86_64).
+Portable Linux build of **Shroud Designer 0.3** (x86_64).
 
 ## Quick install (current user)
 
@@ -57,9 +57,12 @@ directory included with this package.
 ## Use
 
 1. Select an upright GPU connector STL (units = millimetres; opening at max Z).
-2. Choose a custom 120/140 mm fan plate or import a fan connector STL.
-3. Adjust the funnel; the preview updates after each change.
-4. **Save print-ready STL…** — export only succeeds when the result is one
+2. Configure 1–10 GPU copies, their X/Y spacing, and optional bridge style.
+3. Choose a custom 120/140 mm fan plate or import a fan connector STL, then
+   configure 1–4 fan copies, X/Y spacing, and optional full-depth bridges.
+4. Adjust the main funnel and GPU/fan split distances; the preview updates
+   after each change.
+5. **Save print-ready STL…** — export only succeeds when the result is one
    connected, watertight solid.
 
 Preview controls: mouse wheel zoom · left-drag rotate · right-drag pan ·

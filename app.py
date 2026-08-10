@@ -18,6 +18,7 @@ def self_test(report_path: Path) -> int:
     from shroud_designer.geometry import (
         ConnectorStackConfig,
         FanConfig,
+        FanStackConfig,
         FunnelConfig,
         analyze_connector,
         analyze_fan,
@@ -63,6 +64,44 @@ def self_test(report_path: Path) -> int:
                 stack_config=ConnectorStackConfig(count=4, axis="y", spacing=5.0),
             )
         )
+        multi_fan = union_assembly(
+            build_assembly_parts(
+                connector,
+                FunnelConfig(
+                    length=35.0,
+                    fan_split_distance=20.0,
+                    radial_segments=64,
+                    path_segments=24,
+                ),
+                fan_config=FanConfig(),
+                fan_stack_config=FanStackConfig(
+                    count=4, axis="x", spacing=5.0, bridged=True
+                ),
+            )
+        )
+        bridged_arrays = union_assembly(
+            build_assembly_parts(
+                connector,
+                FunnelConfig(
+                    length=30.0,
+                    split_distance=15.0,
+                    fan_split_distance=20.0,
+                    radial_segments=64,
+                    path_segments=24,
+                ),
+                fan_config=FanConfig(),
+                stack_config=ConnectorStackConfig(
+                    count=3,
+                    axis="y",
+                    spacing=5.0,
+                    bridge_mode="front",
+                    bridge_thickness=5.0,
+                ),
+                fan_stack_config=FanStackConfig(
+                    count=2, axis="x", spacing=5.0, bridged=True
+                ),
+            )
+        )
         report = {
             "ok": True,
             "connector_opening_mm": [
@@ -85,6 +124,19 @@ def self_test(report_path: Path) -> int:
                 "watertight": bool(stacked.is_watertight),
                 "components": mesh_component_count(stacked),
                 "triangles": len(stacked.faces),
+            },
+            "multi_fan": {
+                "fan_count": 4,
+                "watertight": bool(multi_fan.is_watertight),
+                "components": mesh_component_count(multi_fan),
+                "triangles": len(multi_fan.faces),
+            },
+            "bridged_arrays": {
+                "connector_count": 3,
+                "fan_count": 2,
+                "watertight": bool(bridged_arrays.is_watertight),
+                "components": mesh_component_count(bridged_arrays),
+                "triangles": len(bridged_arrays.faces),
             },
         }
         code = 0

@@ -1,11 +1,11 @@
-# Shroud Designer 0.2
+# Shroud Designer 0.3
 
 Shroud Designer turns an upright GPU connector STL into one print-ready, airtight shroud assembly. It detects the opening at the connector's highest Z layer, generates a straight/offset or compound-curved transition, adds a custom or imported fan connector, then fuses and validates the result before saving it as STL.
 
 ## Download — Linux
 
-Download `ShroudDesigner-0.2-linux-x86_64.tar.gz` from the
-[v0.2 release](https://github.com/torgles/shroud-designer/releases/tag/v0.2),
+Download `ShroudDesigner-0.3-linux-x86_64.tar.gz` from the
+[v0.3 release](https://github.com/torgles/shroud-designer/releases/tag/v0.3),
 extract it, then run:
 
 ```bash
@@ -19,9 +19,9 @@ can also run the application portably with `./run.sh`.
 
 1. Open **Shroud Designer** from the desktop shortcut (or run the Linux binary).
 2. Select an upright GPU connector STL. STL units are interpreted as millimetres and the opening must be at maximum Z.
-3. Set the connector count from 1–10. Multiple connectors are identical copies and can be stacked along X or Y with a clear spacing between their bodies.
-4. Choose a custom 120/140 mm fan plate or import a finished fan connector STL.
-5. Adjust the funnel. With multiple connectors, **Split distance** controls how far each separate duct travels before entering the shared collector.
+3. Set the connector count from 1–10. Multiple connectors are identical copies and can be stacked along X or Y with clear spacing between their bodies. They may remain unbridged or use a full, front, or back bridge.
+4. Choose a custom 120/140 mm fan plate or import a finished fan connector STL, then select 1–4 identical fans along X or Y. Fan plates may remain unbridged or use a full-depth bridge.
+5. Adjust the funnel. Separate GPU and fan split distances control how far each individual duct travels before entering the shared transition.
 6. Select **Save print-ready STL…**. Export only succeeds when the result is one connected, watertight solid.
 
 Preview controls:
@@ -35,7 +35,9 @@ Preview controls:
 
 - Straight offsets move the fan in X/Y without rotating it.
 - Connector spacing is the clear edge-to-edge gap between the connector STL bounding boxes, not center-to-center spacing.
-- Split distance is measured from the GPU opening toward the fan. A short collector chamber at that height merges the separate airtight ducts into the main funnel.
+- GPU split distance is measured from the GPU openings toward the shared transition. Fan split distance is measured back from the fan openings. Short collector chambers merge each set of airtight ducts into the main funnel.
+- GPU bridges can span the full connector Z length or only a configurable thickness at the front (maximum-Z funnel end) or back. Fan bridges span the full plate depth.
+- Fan spacing is also a clear edge-to-edge gap. Fan arrays support up to four identical custom or imported plates.
 - Compound curves combine the X and Y bend values into one smooth centerline bend. The fan is rotated so its plate remains perpendicular to the outlet.
 - **Arc diameter** is the free inside diameter of the elbow. A larger value produces a wider, gentler curve without allowing the inside wall to fold through itself.
 - The supplied 120 mm reference measures 116 mm at the airflow opening, about 4.6 mm at the screw holes, and uses a 105 mm mounting pattern.
@@ -78,9 +80,9 @@ Produces:
 | Output | Description |
 |--------|-------------|
 | `dist/ShroudDesigner/ShroudDesigner` | Runnable app directory |
-| `dist/ShroudDesigner-0.2-linux-x86_64.tar.gz` | Distributable archive |
+| `dist/ShroudDesigner-0.3-linux-x86_64.tar.gz` | Distributable archive |
 | `Shroud Designer Linux/` | Portable folder with `install.sh` |
-| `public/ShroudDesigner-0.2-linux-x86_64.tar.gz` | Public release archive |
+| `public/ShroudDesigner-0.3-linux-x86_64.tar.gz` | Public release archive |
 
 Install for the current user:
 
@@ -97,7 +99,7 @@ See `linux/README.md` for portable-folder details.
 .\build.ps1
 ```
 
-Creates `dist\ShroudDesigner\ShroudDesigner.exe` and `dist\ShroudDesigner-0.2-Setup.exe`.
+Creates `dist\ShroudDesigner\ShroudDesigner.exe`, `dist\ShroudDesigner-0.3-Setup.exe`, `dist\ShroudDesigner-0.3-windows-x86_64.zip`, and Windows checksums.
 
 ## License
 

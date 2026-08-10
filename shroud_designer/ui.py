@@ -33,6 +33,7 @@ from .geometry import (
     ConnectorStackConfig,
     FanAnalysis,
     FanConfig,
+    FanStackConfig,
     FunnelConfig,
     GeometryError,
     analyze_connector,
@@ -81,7 +82,7 @@ def _spin(
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Shroud Designer 0.2")
+        self.setWindowTitle("Shroud Designer 0.3")
         icon = app_icon_path()
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -114,13 +115,13 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("Shroud Designer")
         title.setObjectName("appTitle")
-        subtitle = QLabel("GPU connector → airtight transition → quiet fan")
+        subtitle = QLabel("GPU connector array → airtight transition → quiet fan array")
         subtitle.setObjectName("subtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header_row.addLayout(title_box)
         header_row.addStretch()
-        version = QLabel("VERSION 0.2")
+        version = QLabel("VERSION 0.3")
         version.setObjectName("versionBadge")
         header_row.addWidget(version, alignment=Qt.AlignmentFlag.AlignTop)
         root.addLayout(header_row)
@@ -199,9 +200,22 @@ class MainWindow(QMainWindow):
         self.connector_spacing.setToolTip(
             "Clear gap between the outside bounding boxes of adjacent connector copies."
         )
+        self.gpu_bridge = QComboBox()
+        self.gpu_bridge.addItem("Unbridged", "unbridged")
+        self.gpu_bridge.addItem("Full length", "full")
+        self.gpu_bridge.addItem("Front (funnel end)", "front")
+        self.gpu_bridge.addItem("Back", "back")
+        self.gpu_bridge_thickness = _spin(
+            0.5, 500.0, 5.0, decimals=1, step=1.0
+        )
+        self.gpu_bridge_thickness.setToolTip(
+            "Z depth of a front or back bridge. Front is the maximum-Z funnel end."
+        )
         opening_form.addRow("Connector count", self.connector_count)
         opening_form.addRow("Stack along", self.stack_axis)
         opening_form.addRow("Clear spacing", self.connector_spacing)
+        opening_form.addRow("Bridge", self.gpu_bridge)
+        opening_form.addRow("Bridge thickness", self.gpu_bridge_thickness)
         layout.addLayout(opening_form)
         return group
 
@@ -213,6 +227,24 @@ class MainWindow(QMainWindow):
         self.fan_mode.addItem("Custom fan plate", "custom")
         self.fan_mode.addItem("Import fan STL", "import")
         mode_form.addRow("Source", self.fan_mode)
+        self.fan_count = QSpinBox()
+        self.fan_count.setRange(1, 4)
+        self.fan_count.setValue(1)
+        self.fan_count.setKeyboardTracking(False)
+        self.fan_stack_axis = QComboBox()
+        self.fan_stack_axis.addItem("Y axis", "y")
+        self.fan_stack_axis.addItem("X axis", "x")
+        self.fan_spacing = _spin(0.0, 500.0, 10.0, decimals=1, step=5.0)
+        self.fan_spacing.setToolTip(
+            "Clear gap between the outside bounding boxes of adjacent fan plates."
+        )
+        self.fan_bridge = QComboBox()
+        self.fan_bridge.addItem("Unbridged", False)
+        self.fan_bridge.addItem("Fully bridged", True)
+        mode_form.addRow("Fan count", self.fan_count)
+        mode_form.addRow("Stack along", self.fan_stack_axis)
+        mode_form.addRow("Clear spacing", self.fan_spacing)
+        mode_form.addRow("Bridge", self.fan_bridge)
         layout.addLayout(mode_form)
 
         self.fan_file_widget = QWidget()
@@ -263,7 +295,14 @@ class MainWindow(QMainWindow):
         self.split_distance.setToolTip(
             "Distance from the GPU openings to the shared collector. Each connector keeps a separate duct up to this height."
         )
-        split_form.addRow("Split distance", self.split_distance)
+        self.gpu_split_label = QLabel("GPU split distance")
+        split_form.addRow(self.gpu_split_label, self.split_distance)
+        self.fan_split_distance = _spin(1.0, 500.0, 20.0, decimals=1, step=5.0)
+        self.fan_split_distance.setToolTip(
+            "Distance from the shared funnel to the fan openings. Each fan keeps a separate duct over this distance."
+        )
+        self.fan_split_label = QLabel("Fan split distance")
+        split_form.addRow(self.fan_split_label, self.fan_split_distance)
         layout.addWidget(self.split_widget)
 
         self.straight_widget = QGroupBox("Straight settings")
@@ -340,6 +379,12 @@ class MainWindow(QMainWindow):
         self.funnel_mode.currentIndexChanged.connect(self._funnel_mode_changed)
         self.connector_count.valueChanged.connect(self._connector_layout_changed)
         self.stack_axis.currentIndexChanged.connect(self._connector_layout_changed)
+        self.connector_spacing.valueChanged.connect(self._connector_layout_changed)
+        self.gpu_bridge.currentIndexChanged.connect(self._connector_layout_changed)
+        self.fan_count.valueChanged.connect(self._fan_layout_changed)
+        self.fan_stack_axis.currentIndexChanged.connect(self._fan_layout_changed)
+        self.fan_spacing.valueChanged.connect(self._fan_layout_changed)
+        self.fan_bridge.currentIndexChanged.connect(self._fan_layout_changed)
         for control in (
             self.wall,
             self.fan_hole,
@@ -352,8 +397,9 @@ class MainWindow(QMainWindow):
             self.lead_in,
             self.lead_out,
             self.arc_diameter,
-            self.connector_spacing,
+            self.gpu_bridge_thickness,
             self.split_distance,
+            self.fan_split_distance,
         ):
             control.valueChanged.connect(self.schedule_preview)
 
@@ -423,10 +469,7 @@ class MainWindow(QMainWindow):
         self.imported_fan = analysis
         self.fan_path.setText(str(path))
         self.fan_path.setToolTip(str(path))
-        self.fan_info.setText(
-            f"Detected {analysis.hole_diameter:.2f} mm opening • "
-            f"{analysis.z_max - analysis.z_min:.2f} mm thick"
-        )
+        self._update_fan_info()
         self.settings.setValue("fan_path", str(path))
         self.settings.setValue("last_folder", str(path.parent))
         self.schedule_preview()
@@ -456,20 +499,45 @@ class MainWindow(QMainWindow):
         self._update_mode_controls()
         self.schedule_preview()
 
+    def _fan_layout_changed(self) -> None:
+        self._has_fitted_assembly = False
+        self._update_fan_info()
+        self._update_mode_controls()
+        self.schedule_preview()
+
     def _fan_mode_changed(self) -> None:
         self._update_mode_controls()
         if self.fan_mode.currentData() == "import" and self.imported_fan is None:
             saved = Path(str(self.settings.value("fan_path", "")))
             default = resource_path("Fans/default 120mm fan for shroud.stl")
             self.load_fan(saved if saved.is_file() else default)
+        self._update_fan_info()
         self.schedule_preview()
 
     def _fan_size_changed(self) -> None:
         size = float(self.fan_size.currentData())
         self.fan_hole.setValue(136.0 if size == 140.0 else 116.0)
-        spacing = 124.5 if size == 140.0 else 105.0
-        self.fan_info.setText(f"{spacing:g} mm mounting pattern • 3 mm plate")
+        self._update_fan_info()
         self.schedule_preview()
+
+    def _update_fan_info(self) -> None:
+        count = self.fan_count.value()
+        copies = (
+            ""
+            if count == 1
+            else f" • {count} copies along {str(self.fan_stack_axis.currentData()).upper()}"
+        )
+        if self.fan_mode.currentData() == "import" and self.imported_fan is not None:
+            analysis = self.imported_fan
+            description = (
+                f"Detected {analysis.hole_diameter:.2f} mm opening • "
+                f"{analysis.z_max - analysis.z_min:.2f} mm thick"
+            )
+        else:
+            size = float(self.fan_size.currentData())
+            spacing = 124.5 if size == 140.0 else 105.0
+            description = f"{spacing:g} mm mounting pattern • 3 mm plate"
+        self.fan_info.setText(description + copies)
 
     def _funnel_mode_changed(self) -> None:
         self._update_mode_controls()
@@ -482,10 +550,22 @@ class MainWindow(QMainWindow):
         curved = bool(self.funnel_mode.currentData())
         self.straight_widget.setEnabled(not curved)
         self.curve_widget.setEnabled(curved)
-        multiple = self.connector_count.value() > 1
-        self.stack_axis.setEnabled(multiple)
-        self.connector_spacing.setEnabled(multiple)
-        self.split_widget.setVisible(multiple)
+        gpu_multiple = self.connector_count.value() > 1
+        fan_multiple = self.fan_count.value() > 1
+        self.stack_axis.setEnabled(gpu_multiple)
+        self.connector_spacing.setEnabled(gpu_multiple)
+        self.gpu_bridge.setEnabled(gpu_multiple)
+        self.gpu_bridge_thickness.setEnabled(
+            gpu_multiple and self.gpu_bridge.currentData() in {"front", "back"}
+        )
+        self.fan_stack_axis.setEnabled(fan_multiple)
+        self.fan_spacing.setEnabled(fan_multiple)
+        self.fan_bridge.setEnabled(fan_multiple)
+        self.split_widget.setVisible(gpu_multiple or fan_multiple)
+        self.gpu_split_label.setVisible(gpu_multiple)
+        self.split_distance.setVisible(gpu_multiple)
+        self.fan_split_label.setVisible(fan_multiple)
+        self.fan_split_distance.setVisible(fan_multiple)
 
     def schedule_preview(self) -> None:
         if self._building:
@@ -508,17 +588,30 @@ class MainWindow(QMainWindow):
             arc_diameter=self.arc_diameter.value(),
             outlet_diameter=self.fan_hole.value(),
             split_distance=self.split_distance.value(),
+            fan_split_distance=self.fan_split_distance.value(),
         )
         stack = ConnectorStackConfig(
             count=self.connector_count.value(),
             axis=str(self.stack_axis.currentData()),
             spacing=self.connector_spacing.value(),
+            bridge_mode=str(self.gpu_bridge.currentData()),
+            bridge_thickness=self.gpu_bridge_thickness.value(),
+        )
+        fan_stack = FanStackConfig(
+            count=self.fan_count.value(),
+            axis=str(self.fan_stack_axis.currentData()),
+            spacing=self.fan_spacing.value(),
+            bridged=bool(self.fan_bridge.currentData()),
         )
         if self.fan_mode.currentData() == "import":
             if self.imported_fan is None:
                 raise GeometryError("Choose a fan connector STL.")
             return build_assembly_parts(
-                self.connector, funnel, imported_fan=self.imported_fan, stack_config=stack
+                self.connector,
+                funnel,
+                imported_fan=self.imported_fan,
+                stack_config=stack,
+                fan_stack_config=fan_stack,
             )
         fan = FanConfig(
             size=float(self.fan_size.currentData()),
@@ -526,7 +619,11 @@ class MainWindow(QMainWindow):
             screw_hole_diameter=self.screw_hole.value(),
         )
         return build_assembly_parts(
-            self.connector, funnel, fan_config=fan, stack_config=stack
+            self.connector,
+            funnel,
+            fan_config=fan,
+            stack_config=stack,
+            fan_stack_config=fan_stack,
         )
 
     def rebuild_preview(self) -> None:
@@ -550,6 +647,7 @@ class MainWindow(QMainWindow):
             message = (
                 f"Preview ready • {parts.funnel_result.centerline_length:.1f} mm centerline "
                 f"• {self.connector_count.value()} GPU connector(s) "
+                f"• {self.fan_count.value()} fan(s) "
                 f"• {len(parts.funnel.faces):,} funnel triangles"
             )
             if parts.funnel_result.warnings:
@@ -628,11 +726,11 @@ QGroupBox::title {
     font-size: 8.5pt; letter-spacing: 1px;
 }
 QGroupBox QGroupBox { background: #141e2c; border-color: #26364a; font-weight: 500; }
-QLineEdit, QComboBox, QDoubleSpinBox {
+QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {
     background: #0d1522; border: 1px solid #33465c; border-radius: 5px;
     padding: 6px 7px; min-height: 20px; selection-background-color: #1c8b8b;
 }
-QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus { border-color: #38b9b2; }
+QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus { border-color: #38b9b2; }
 QComboBox::drop-down { border: 0; width: 22px; }
 QPushButton {
     background: #26384d; border: 1px solid #38516d; border-radius: 5px;
@@ -640,7 +738,7 @@ QPushButton {
 }
 QPushButton:hover { background: #314861; border-color: #4c6988; }
 QPushButton:pressed { background: #1c2b3d; }
-QPushButton:disabled, QComboBox:disabled, QDoubleSpinBox:disabled {
+QPushButton:disabled, QComboBox:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled {
     color: #637287; background: #141c27; border-color: #263140;
 }
 QPushButton#primaryButton {
