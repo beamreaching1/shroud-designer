@@ -1,0 +1,911 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from math import atan2, cos, pi, radians, sin, sqrt
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import trimesh
+import mapbox_earcut
+from shapely.affinity import translate as translate_polygon
+from shapely.geometry import Point, Polygon, box
+from shapely.geometry.polygon import orient
+from shapely.ops import unary_union
+
+
+class GeometryError(RuntimeError):
+    """A user-facing geometry error."""
+
+
+@dataclass(slots=True)
+class OpeningCandidate:
+    polygon: Polygon
+    area: float
+    width: float
+    depth: float
+
+    @property
+    def label(self) -> str:
+        return f"{self.width:.1f} x {self.depth:.1f} mm ({self.area:.0f} mm²)"
+
+
+@dataclass(slots=True)
+class ConnectorAnalysis:
+    path: Path
+    mesh: trimesh.Trimesh
+    top_z: float
+    candidates: list[OpeningCandidate]
+    outer_polygon: Polygon
+    selected_index: int = 0
+
+    @property
+    def opening(self) -> OpeningCandidate:
+        return self.candidates[self.selected_index]
+
+
+@dataclass(slots=True)
+class FanAnalysis:
+    path: Path
+    mesh: trimesh.Trimesh
+    hole_polygon: Polygon
+    hole_center: np.ndarray
+    hole_diameter: float
+    z_min: float
+    z_max: float
+
+
+@dataclass(slots=True)
+class FunnelConfig:
+    wall_thickness: float = 1.0
+    curved: bool = False
+    length: float = 50.0
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+    angle_x: float = 0.0
+    angle_y: float = 0.0
+    lead_in: float = 25.0
+    lead_out: float = 25.0
+    arc_diameter: float = 60.0
+    outlet_diameter: float = 116.0
+    radial_segments: int = 128
+    path_segments: int = 48
+    join_overlap: float = 0.30
+    split_distance: float = 20.0
+
+
+@dataclass(slots=True)
+class ConnectorStackConfig:
+    count: int = 1
+    axis: str = "y"
+    spacing: float = 0.0
+
+
+@dataclass(slots=True)
+class FanConfig:
+    size: float = 120.0
+    hole_diameter: float = 116.0
+    screw_hole_diameter: float = 4.6
+    thickness: float = 3.0
+    corner_radius: float = 5.0
+
+    @property
+    def screw_spacing(self) -> float:
+        if abs(self.size - 140.0) < 0.01:
+            return 124.5
+        if abs(self.size - 120.0) < 0.01:
+            return 105.0
+        # Preserve the 7.5 mm edge inset used by the supplied 120 mm plate.
+        return max(1.0, self.size - 15.0)
+
+
+@dataclass(slots=True)
+class FunnelResult:
+    mesh: trimesh.Trimesh
+    outlet_center: np.ndarray
+    outlet_basis: np.ndarray
+    centerline_length: float
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class AssemblyParts:
+    gpu: trimesh.Trimesh
+    funnel: trimesh.Trimesh
+    fan: trimesh.Trimesh
+    funnel_result: FunnelResult
+
+    @property
+    def meshes(self) -> list[trimesh.Trimesh]:
+        return [self.gpu, self.funnel, self.fan]
+
+
+def _load_mesh(path: str | Path) -> trimesh.Trimesh:
+    source = Path(path)
+    if not source.is_file():
+        raise GeometryError(f"STL file not found: {source}")
+    loaded = trimesh.load(source, force="mesh", process=True)
+    if isinstance(loaded, trimesh.Scene):
+        loaded = loaded.to_mesh()
+    if not isinstance(loaded, trimesh.Trimesh) or len(loaded.faces) == 0:
+        raise GeometryError(f"No triangle mesh was found in {source.name}.")
+    loaded.remove_unreferenced_vertices()
+    loaded.merge_vertices()
+    if not loaded.is_winding_consistent:
+        loaded.fix_normals()
+    return loaded
+
+
+def _slice_polygons(mesh: trimesh.Trimesh, z: float) -> list[Polygon]:
+    # Intersect triangles directly instead of using trimesh.Path. The latter pulls
+    # in scipy just to walk a tiny edge graph, which is unnecessary for this app.
+    segments: list[tuple[np.ndarray, np.ndarray]] = []
+    tolerance = 1e-8
+    for triangle in np.asarray(mesh.triangles, dtype=float):
+        distances = triangle[:, 2] - z
+        if np.min(distances) > tolerance or np.max(distances) < -tolerance:
+            continue
+        intersections: list[np.ndarray] = []
+        for first, second in ((0, 1), (1, 2), (2, 0)):
+            point_a, point_b = triangle[first], triangle[second]
+            distance_a, distance_b = distances[first], distances[second]
+            if abs(distance_a) <= tolerance:
+                intersections.append(point_a[:2])
+            if distance_a * distance_b < -(tolerance**2):
+                fraction = distance_a / (distance_a - distance_b)
+                intersections.append((point_a + fraction * (point_b - point_a))[:2])
+        unique: list[np.ndarray] = []
+        for point in intersections:
+            if not any(np.linalg.norm(point - existing) <= 1e-7 for existing in unique):
+                unique.append(point)
+        if len(unique) == 2:
+            segments.append((unique[0], unique[1]))
+
+    if not segments:
+        return []
+
+    quantization = 1e-5
+    coordinates: dict[tuple[int, int], np.ndarray] = {}
+    adjacency: dict[tuple[int, int], set[tuple[int, int]]] = {}
+    unused_edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+
+    def key(point: np.ndarray) -> tuple[int, int]:
+        return tuple(np.round(point / quantization).astype(np.int64))  # type: ignore[return-value]
+
+    for point_a, point_b in segments:
+        key_a, key_b = key(point_a), key(point_b)
+        if key_a == key_b:
+            continue
+        coordinates.setdefault(key_a, point_a)
+        coordinates.setdefault(key_b, point_b)
+        adjacency.setdefault(key_a, set()).add(key_b)
+        adjacency.setdefault(key_b, set()).add(key_a)
+        unused_edges.add(tuple(sorted((key_a, key_b))))
+
+    loops: list[np.ndarray] = []
+    while unused_edges:
+        first_edge = next(iter(unused_edges))
+        start, current = first_edge
+        unused_edges.remove(first_edge)
+        loop_keys = [start]
+        guard = 0
+        while current != start and guard <= len(adjacency) + 1:
+            loop_keys.append(current)
+            options = [
+                neighbor
+                for neighbor in adjacency.get(current, ())
+                if tuple(sorted((current, neighbor))) in unused_edges
+            ]
+            if not options:
+                break
+            next_key = options[0]
+            unused_edges.remove(tuple(sorted((current, next_key))))
+            current = next_key
+            guard += 1
+        if current == start and len(loop_keys) >= 3:
+            loops.append(np.array([coordinates[item] for item in loop_keys], dtype=float))
+
+    polygons: list[Polygon] = []
+    for points in loops:
+        if len(points) < 4:
+            continue
+        polygon = Polygon(points)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if isinstance(polygon, Polygon) and polygon.area > 0.5:
+            polygons.append(orient(polygon, sign=1.0))
+    return sorted(polygons, key=lambda item: item.area, reverse=True)
+
+
+def _horizontal_section(mesh: trimesh.Trimesh, near_z: float) -> tuple[float, list[Polygon]]:
+    z_extent = float(mesh.extents[2])
+    initial = min(0.10, max(0.02, z_extent * 0.001))
+    for distance in (initial, 0.01, 0.05, 0.15, 0.5, 1.0):
+        z = near_z - distance
+        polygons = _slice_polygons(mesh, z)
+        if len(polygons) >= 2:
+            return z, polygons
+    raise GeometryError(
+        "Could not find a closed opening just below the model's top layer. "
+        "Check that the STL is upright and its duct opening is at maximum Z."
+    )
+
+
+def _contained_holes(outer: Polygon, polygons: Iterable[Polygon]) -> list[Polygon]:
+    holes = [
+        polygon
+        for polygon in polygons
+        if outer.buffer(0.05).contains(polygon.representative_point())
+        and polygon.area < outer.area * 0.995
+    ]
+    return sorted(holes, key=lambda item: item.area, reverse=True)
+
+
+def analyze_connector(path: str | Path) -> ConnectorAnalysis:
+    mesh = _load_mesh(path)
+    if not mesh.is_watertight:
+        raise GeometryError(
+            "The GPU connector STL is not watertight. Repair the STL before using it "
+            "so the final assembly can be airtight."
+        )
+
+    top_z = float(mesh.bounds[1, 2])
+    _, polygons = _horizontal_section(mesh, top_z)
+    outer = polygons[0]
+    openings = _contained_holes(outer, polygons[1:])
+    if not openings:
+        raise GeometryError("No opening was detected inside the topmost perimeter.")
+
+    candidates = []
+    for polygon in openings:
+        min_x, min_y, max_x, max_y = polygon.bounds
+        candidates.append(
+            OpeningCandidate(
+                polygon=polygon,
+                area=float(polygon.area),
+                width=float(max_x - min_x),
+                depth=float(max_y - min_y),
+            )
+        )
+    return ConnectorAnalysis(Path(path), mesh, top_z, candidates, outer)
+
+
+def analyze_fan(path: str | Path) -> FanAnalysis:
+    mesh = _load_mesh(path)
+    if not mesh.is_watertight:
+        raise GeometryError("The imported fan connector STL is not watertight.")
+
+    z_min, z_max = (float(mesh.bounds[0, 2]), float(mesh.bounds[1, 2]))
+    polygons = _slice_polygons(mesh, (z_min + z_max) / 2.0)
+    if len(polygons) < 2:
+        raise GeometryError("No central fan opening was detected in this STL.")
+    outer = polygons[0]
+    holes = _contained_holes(outer, polygons[1:])
+    if not holes:
+        raise GeometryError("No central fan opening was detected in this STL.")
+
+    # The airflow opening is the largest hole. The smaller holes are fasteners.
+    hole = holes[0]
+    center = hole.centroid
+    min_x, min_y, max_x, max_y = hole.bounds
+    diameter = ((max_x - min_x) + (max_y - min_y)) / 2.0
+    return FanAnalysis(
+        Path(path),
+        mesh,
+        hole,
+        np.array([center.x, center.y], dtype=float),
+        float(diameter),
+        z_min,
+        z_max,
+    )
+
+
+def _resample_boundary(
+    polygon: Polygon,
+    count: int,
+    start_near: np.ndarray | None = None,
+) -> np.ndarray:
+    polygon = orient(polygon, sign=1.0)
+    ring = polygon.exterior
+    length = ring.length
+    points = np.array(
+        [ring.interpolate(length * index / count).coords[0] for index in range(count)],
+        dtype=float,
+    )
+    if start_near is None:
+        # A stable start point on the right side minimizes visible loft twist.
+        center = np.asarray(polygon.centroid.coords[0])
+        scores = points[:, 0] - 0.001 * np.abs(points[:, 1] - center[1])
+        start = int(np.argmax(scores))
+    else:
+        start = int(np.argmin(np.linalg.norm(points - start_near, axis=1)))
+    return np.roll(points, -start, axis=0)
+
+
+def _rodrigues(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
+    if abs(angle) < 1e-12:
+        return vector.copy()
+    return (
+        vector * cos(angle)
+        + np.cross(axis, vector) * sin(angle)
+        + axis * np.dot(axis, vector) * (1.0 - cos(angle))
+    )
+
+
+def _mesh_from_rings(outer_rings: list[np.ndarray], inner_rings: list[np.ndarray]) -> trimesh.Trimesh:
+    if len(outer_rings) != len(inner_rings) or len(outer_rings) < 2:
+        raise GeometryError("The funnel needs at least two matching cross-sections.")
+    ring_count = len(outer_rings)
+    point_count = len(outer_rings[0])
+    outer_vertices = np.concatenate(outer_rings, axis=0)
+    inner_vertices = np.concatenate(inner_rings, axis=0)
+    vertices = np.vstack((outer_vertices, inner_vertices))
+    inner_base = ring_count * point_count
+
+    def outer_index(section: int, point: int) -> int:
+        return section * point_count + point % point_count
+
+    def inner_index(section: int, point: int) -> int:
+        return inner_base + section * point_count + point % point_count
+
+    faces: list[list[int]] = []
+    for section in range(ring_count - 1):
+        for point in range(point_count):
+            next_point = (point + 1) % point_count
+            faces.extend(
+                [
+                    [
+                        outer_index(section, point),
+                        outer_index(section, next_point),
+                        outer_index(section + 1, next_point),
+                    ],
+                    [
+                        outer_index(section, point),
+                        outer_index(section + 1, next_point),
+                        outer_index(section + 1, point),
+                    ],
+                    [
+                        inner_index(section, point),
+                        inner_index(section + 1, next_point),
+                        inner_index(section, next_point),
+                    ],
+                    [
+                        inner_index(section, point),
+                        inner_index(section + 1, point),
+                        inner_index(section + 1, next_point),
+                    ],
+                ]
+            )
+
+    last = ring_count - 1
+    for point in range(point_count):
+        next_point = (point + 1) % point_count
+        faces.extend(
+            [
+                [outer_index(0, point), inner_index(0, point), inner_index(0, next_point)],
+                [outer_index(0, point), inner_index(0, next_point), outer_index(0, next_point)],
+                [outer_index(last, point), outer_index(last, next_point), inner_index(last, next_point)],
+                [outer_index(last, point), inner_index(last, next_point), inner_index(last, point)],
+            ]
+        )
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=np.asarray(faces), process=True)
+    mesh.remove_unreferenced_vertices()
+    if not mesh.is_winding_consistent:
+        mesh.fix_normals()
+    if not mesh.is_watertight:
+        raise GeometryError("The generated funnel was not watertight. Try gentler settings.")
+    return mesh
+
+
+def _solid_loft(
+    start: Polygon,
+    start_z: float,
+    end: Polygon,
+    end_z: float,
+    point_count: int,
+    sections: int,
+    convergence_fraction: float,
+) -> trimesh.Trimesh:
+    start = orient(start, sign=1.0)
+    end = orient(end, sign=1.0)
+    start_points = _resample_boundary(start, point_count)
+    end_points = _resample_boundary(end, point_count)
+    rings: list[np.ndarray] = []
+    for fraction in np.linspace(0.0, 1.0, max(2, sections) + 1):
+        shape_fraction = min(fraction / convergence_fraction, 1.0)
+        z = start_z * (1.0 - fraction) + end_z * fraction
+        points = start_points * (1.0 - shape_fraction) + end_points * shape_fraction
+        rings.append(np.column_stack((points, np.full(point_count, z))))
+
+    ring_count = len(rings)
+    vertices = np.concatenate(rings, axis=0)
+    faces: list[list[int]] = []
+    for section in range(ring_count - 1):
+        lower = section * point_count
+        upper = (section + 1) * point_count
+        for point in range(point_count):
+            next_point = (point + 1) % point_count
+            faces.extend(
+                [
+                    [lower + point, lower + next_point, upper + next_point],
+                    [lower + point, upper + next_point, upper + point],
+                ]
+            )
+    cap_indices = mapbox_earcut.triangulate_float64(
+        np.asarray(rings[0][:, :2], dtype=np.float64),
+        np.asarray([point_count], dtype=np.uint32),
+    ).reshape((-1, 3))
+    last = (ring_count - 1) * point_count
+    for triangle in cap_indices:
+        a, b, c = (int(value) for value in triangle)
+        faces.extend([[c, b, a], [last + a, last + b, last + c]])
+    mesh = trimesh.Trimesh(vertices=vertices, faces=np.asarray(faces), process=True)
+    mesh.remove_unreferenced_vertices()
+    if not mesh.is_winding_consistent:
+        mesh.fix_normals()
+    if not mesh.is_watertight:
+        raise GeometryError("A generated split volume was not watertight.")
+    return mesh
+
+
+def _boolean_union(meshes: list[trimesh.Trimesh], description: str) -> trimesh.Trimesh:
+    try:
+        result = trimesh.boolean.union(meshes, engine="manifold", check_volume=False)
+    except Exception as exc:
+        raise GeometryError(f"Could not merge {description}: {exc}") from exc
+    if result is None:
+        raise GeometryError(f"Could not merge {description}.")
+    if isinstance(result, trimesh.Scene):
+        result = result.to_mesh()
+    return result
+
+
+def _make_branch_manifold(
+    openings: list[Polygon],
+    top_z: float,
+    split_z: float,
+    wall_thickness: float,
+    point_count: int,
+    path_segments: int,
+    overlap: float,
+) -> tuple[trimesh.Trimesh, Polygon]:
+    combined = unary_union(openings).convex_hull
+    if not isinstance(combined, Polygon):
+        raise GeometryError("The stacked openings could not be combined into a manifold.")
+    combined = orient(combined, sign=1.0)
+    combined_outer = combined.buffer(wall_thickness, join_style="round")
+    if not isinstance(combined_outer, Polygon):
+        raise GeometryError("The merged opening could not be offset into a wall.")
+    sections = max(2, min(12, int(path_segments / 4)))
+    split_distance = split_z - top_z
+    chamber_height = max(0.1, min(8.0, split_distance * 0.5))
+    chamber_bottom = split_z - chamber_height
+
+    # Separate straight ducts enter a short collector chamber. Building the
+    # material as outer solid volumes minus overlapping airflow volumes keeps
+    # the manifold reliable from two connectors all the way through ten.
+    outer_volumes = [
+        _solid_loft(
+            opening.buffer(wall_thickness, join_style="round"),
+            top_z - overlap,
+            opening.buffer(wall_thickness, join_style="round"),
+            chamber_bottom + overlap,
+            point_count,
+            sections,
+            1.0,
+        )
+        for opening in openings
+    ]
+    outer_volumes.append(
+        _solid_loft(
+            combined_outer,
+            chamber_bottom,
+            combined_outer,
+            split_z + overlap,
+            point_count,
+            4,
+            1.0,
+        )
+    )
+    inner_volumes = [
+        _solid_loft(
+            opening,
+            top_z - overlap * 2.0,
+            opening,
+            chamber_bottom + chamber_height * 0.75,
+            point_count,
+            sections,
+            1.0,
+        )
+        for opening in openings
+    ]
+    inner_volumes.append(
+        _solid_loft(
+            combined,
+            chamber_bottom + chamber_height * 0.25,
+            combined,
+            split_z + overlap * 2.0,
+            point_count,
+            4,
+            1.0,
+        )
+    )
+    outer = _boolean_union(outer_volumes, "the outside of the connector branches")
+    inner = _boolean_union(inner_volumes, "the airflow passages")
+    try:
+        shell = trimesh.boolean.difference(
+            [outer, inner], engine="manifold", check_volume=False
+        )
+    except Exception as exc:
+        raise GeometryError(f"Could not hollow the connector branches: {exc}") from exc
+    if shell is None:
+        raise GeometryError("Could not hollow the connector branches.")
+    if isinstance(shell, trimesh.Scene):
+        shell = shell.to_mesh()
+    shell.remove_unreferenced_vertices()
+    if not shell.is_winding_consistent:
+        shell.fix_normals()
+    if not shell.is_watertight or mesh_component_count(shell) != 1:
+        raise GeometryError("The connector branch manifold is not one watertight solid.")
+    return shell, combined
+
+
+def make_funnel(
+    opening: Polygon,
+    top_z: float,
+    config: FunnelConfig,
+) -> FunnelResult:
+    if config.wall_thickness <= 0:
+        raise GeometryError("Wall thickness must be greater than zero.")
+    if config.outlet_diameter <= 0:
+        raise GeometryError("Fan hole diameter must be greater than zero.")
+
+    opening = orient(opening, sign=1.0)
+    buffered = opening.buffer(config.wall_thickness, join_style="round")
+    if not isinstance(buffered, Polygon):
+        raise GeometryError("The selected opening cannot be offset into a funnel wall.")
+
+    count = max(32, int(config.radial_segments))
+    center_2d = np.asarray(opening.centroid.coords[0], dtype=float)
+    base_inner_abs = _resample_boundary(opening, count)
+    base_outer_abs = _resample_boundary(buffered, count, base_inner_abs[0])
+    base_inner = base_inner_abs - center_2d
+    base_outer = base_outer_abs - center_2d
+
+    start_angle = atan2(base_inner[0, 1], base_inner[0, 0])
+    angles = start_angle + np.arange(count, dtype=float) * 2.0 * pi / count
+    outlet_inner = np.column_stack((np.cos(angles), np.sin(angles))) * (
+        config.outlet_diameter / 2.0
+    )
+    outlet_outer = np.column_stack((np.cos(angles), np.sin(angles))) * (
+        config.outlet_diameter / 2.0 + config.wall_thickness
+    )
+
+    base_center = np.array([center_2d[0], center_2d[1], top_z], dtype=float)
+    identity = np.eye(3, dtype=float)
+    warnings: list[str] = []
+
+    if not config.curved:
+        if config.length <= 0:
+            raise GeometryError("Funnel length must be greater than zero.")
+        segment_count = max(2, int(config.path_segments))
+        fractions = np.linspace(0.0, 1.0, segment_count + 1)
+        centers = [
+            base_center
+            + np.array(
+                [
+                    config.offset_x * fraction,
+                    config.offset_y * fraction,
+                    -config.join_overlap + (config.length + config.join_overlap) * fraction,
+                ]
+            )
+            for fraction in fractions
+        ]
+        frames = [identity] * len(centers)
+        shape_fractions = fractions
+        outlet_center = base_center + np.array(
+            [config.offset_x, config.offset_y, config.length], dtype=float
+        )
+        outlet_basis = identity
+        centerline_length = sqrt(
+            config.length**2 + config.offset_x**2 + config.offset_y**2
+        )
+    else:
+        if config.lead_in < 0 or config.lead_out < 0:
+            raise GeometryError("Curve lead lengths cannot be negative.")
+        component_magnitude = sqrt(config.angle_x**2 + config.angle_y**2)
+        if component_magnitude > 165.0:
+            raise GeometryError("The combined X/Y bend angle must be 165° or less.")
+        theta = radians(component_magnitude)
+        if component_magnitude < 1e-9:
+            horizontal = np.array([1.0, 0.0, 0.0])
+        else:
+            horizontal = np.array(
+                [config.angle_x / component_magnitude, config.angle_y / component_magnitude, 0.0]
+            )
+        axis = np.array([-horizontal[1], horizontal[0], 0.0], dtype=float)
+        # "Arc diameter" is the free diameter on the inside of the elbow. This keeps
+        # a value of zero physically printable and makes larger values progressively gentler.
+        outer_radius = config.outlet_diameter / 2.0 + config.wall_thickness
+        bend_radius = outer_radius + max(0.0, config.arc_diameter) / 2.0
+        arc_length = bend_radius * theta
+        total_length = config.lead_in + arc_length + config.lead_out
+        if total_length <= 0:
+            raise GeometryError("A curved funnel needs a bend angle or a lead length.")
+
+        segment_count = max(8, int(config.path_segments))
+        distances = np.linspace(-config.join_overlap, total_length, segment_count + 1)
+        bend_start = base_center + np.array([0.0, 0.0, config.lead_in])
+        bend_end = bend_start + bend_radius * (
+            sin(theta) * np.array([0.0, 0.0, 1.0])
+            + (1.0 - cos(theta)) * horizontal
+        )
+        final_direction = (
+            cos(theta) * np.array([0.0, 0.0, 1.0]) + sin(theta) * horizontal
+        )
+        centers = []
+        frames = []
+        for distance in distances:
+            if distance <= config.lead_in:
+                center = base_center + np.array([0.0, 0.0, distance])
+                local_angle = 0.0
+            elif distance < config.lead_in + arc_length and theta > 0:
+                local_angle = (distance - config.lead_in) / bend_radius
+                center = bend_start + bend_radius * (
+                    sin(local_angle) * np.array([0.0, 0.0, 1.0])
+                    + (1.0 - cos(local_angle)) * horizontal
+                )
+            else:
+                local_angle = theta
+                center = bend_end + final_direction * (
+                    distance - config.lead_in - arc_length
+                )
+            x_axis = _rodrigues(identity[:, 0], axis, local_angle)
+            y_axis = _rodrigues(identity[:, 1], axis, local_angle)
+            z_axis = _rodrigues(identity[:, 2], axis, local_angle)
+            centers.append(center)
+            frames.append(np.column_stack((x_axis, y_axis, z_axis)))
+        shape_fractions = (distances + config.join_overlap) / (
+            total_length + config.join_overlap
+        )
+        outlet_center = bend_end + final_direction * config.lead_out
+        outlet_basis = frames[-1]
+        centerline_length = total_length
+        if component_magnitude > 120:
+            warnings.append("Very large bend angles can be difficult to print without support.")
+
+    outer_rings: list[np.ndarray] = []
+    inner_rings: list[np.ndarray] = []
+    for fraction, center, basis in zip(shape_fractions, centers, frames, strict=True):
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        inner_2d = base_inner * (1.0 - fraction) + outlet_inner * fraction
+        outer_2d = base_outer * (1.0 - fraction) + outlet_outer * fraction
+        inner_3d = (
+            center
+            + inner_2d[:, 0, None] * basis[:, 0]
+            + inner_2d[:, 1, None] * basis[:, 1]
+        )
+        outer_3d = (
+            center
+            + outer_2d[:, 0, None] * basis[:, 0]
+            + outer_2d[:, 1, None] * basis[:, 1]
+        )
+        inner_rings.append(inner_3d)
+        outer_rings.append(outer_3d)
+
+    mesh = _mesh_from_rings(outer_rings, inner_rings)
+    return FunnelResult(mesh, outlet_center, outlet_basis, centerline_length, warnings)
+
+
+def make_custom_fan(config: FanConfig) -> trimesh.Trimesh:
+    if config.size <= 0 or config.thickness <= 0:
+        raise GeometryError("Fan size and plate thickness must be greater than zero.")
+    if config.hole_diameter <= 0 or config.hole_diameter >= config.size:
+        raise GeometryError("The fan opening must be smaller than the fan plate.")
+    if config.screw_hole_diameter <= 0:
+        raise GeometryError("Screw hole diameter must be greater than zero.")
+
+    half = config.size / 2.0
+    radius = min(max(config.corner_radius, 0.0), half - 0.1)
+    if radius > 0:
+        outer = box(-half + radius, -half + radius, half - radius, half - radius).buffer(
+            radius, quad_segs=12
+        )
+    else:
+        outer = box(-half, -half, half, half)
+
+    cuts = [Point(0.0, 0.0).buffer(config.hole_diameter / 2.0, quad_segs=48)]
+    mount = config.screw_spacing / 2.0
+    for x in (-mount, mount):
+        for y in (-mount, mount):
+            cuts.append(Point(x, y).buffer(config.screw_hole_diameter / 2.0, quad_segs=16))
+    plate = outer
+    for cut in cuts:
+        plate = plate.difference(cut)
+    if not isinstance(plate, Polygon):
+        raise GeometryError("Those fan settings do not leave a connected mounting plate.")
+
+    mesh = trimesh.creation.extrude_polygon(plate, height=config.thickness, engine="earcut")
+    mesh.remove_unreferenced_vertices()
+    if not mesh.is_winding_consistent:
+        mesh.fix_normals()
+    if not mesh.is_watertight:
+        raise GeometryError("The custom fan connector could not be made watertight.")
+    return mesh
+
+
+def place_fan(
+    mesh: trimesh.Trimesh,
+    local_hole_center: np.ndarray,
+    local_z_min: float,
+    funnel: FunnelResult,
+    overlap: float,
+) -> trimesh.Trimesh:
+    placed = mesh.copy()
+    local = placed.vertices.copy()
+    local[:, 0] -= float(local_hole_center[0])
+    local[:, 1] -= float(local_hole_center[1])
+    local[:, 2] -= float(local_z_min) + overlap
+    placed.vertices = funnel.outlet_center + local @ funnel.outlet_basis.T
+    placed.remove_unreferenced_vertices()
+    return placed
+
+
+def build_assembly_parts(
+    connector: ConnectorAnalysis,
+    funnel_config: FunnelConfig,
+    fan_config: FanConfig | None = None,
+    imported_fan: FanAnalysis | None = None,
+    stack_config: ConnectorStackConfig | None = None,
+) -> AssemblyParts:
+    if (fan_config is None) == (imported_fan is None):
+        raise GeometryError("Choose either a custom fan connector or an imported fan STL.")
+
+    if imported_fan is not None:
+        funnel_config.outlet_diameter = imported_fan.hole_diameter
+    else:
+        assert fan_config is not None
+        funnel_config.outlet_diameter = fan_config.hole_diameter
+
+    stack = stack_config or ConnectorStackConfig()
+    if not 1 <= stack.count <= 10:
+        raise GeometryError("GPU connector count must be between 1 and 10.")
+    if stack.axis not in {"x", "y"}:
+        raise GeometryError("GPU connectors can only be stacked along X or Y.")
+    if stack.spacing < 0:
+        raise GeometryError("GPU connector spacing cannot be negative.")
+
+    axis_index = 0 if stack.axis == "x" else 1
+    step = float(connector.mesh.extents[axis_index]) + stack.spacing
+    offsets = (np.arange(stack.count, dtype=float) - (stack.count - 1) / 2.0) * step
+    translations = [
+        np.array([offset if stack.axis == "x" else 0.0, offset if stack.axis == "y" else 0.0, 0.0])
+        for offset in offsets
+    ]
+    gpu_meshes = []
+    openings = []
+    for translation in translations:
+        gpu = connector.mesh.copy()
+        gpu.apply_translation(translation)
+        gpu_meshes.append(gpu)
+        openings.append(
+            translate_polygon(
+                connector.opening.polygon,
+                xoff=float(translation[0]),
+                yoff=float(translation[1]),
+            )
+        )
+    gpu_mesh = trimesh.util.concatenate(gpu_meshes)
+
+    effective_overlap = funnel_config.join_overlap
+    if stack.count == 1:
+        funnel = make_funnel(openings[0], connector.top_z, funnel_config)
+    else:
+        if funnel_config.split_distance <= 0:
+            raise GeometryError("Split distance must be greater than zero.")
+        effective_overlap = max(1.0, funnel_config.join_overlap)
+        multi_funnel_config = replace(funnel_config, join_overlap=effective_overlap)
+        split_z = connector.top_z + funnel_config.split_distance
+        branch_mesh, combined_opening = _make_branch_manifold(
+            openings,
+            connector.top_z,
+            split_z,
+            funnel_config.wall_thickness,
+            max(32, int(funnel_config.radial_segments)),
+            max(8, int(funnel_config.path_segments)),
+            effective_overlap,
+        )
+        main_funnel = make_funnel(combined_opening, split_z, multi_funnel_config)
+        funnel_mesh = _boolean_union(
+            [branch_mesh, main_funnel.mesh], "the split manifold and main funnel"
+        )
+        funnel_mesh.remove_unreferenced_vertices()
+        if not funnel_mesh.is_winding_consistent:
+            funnel_mesh.fix_normals()
+        funnel = FunnelResult(
+            funnel_mesh,
+            main_funnel.outlet_center,
+            main_funnel.outlet_basis,
+            funnel_config.split_distance + main_funnel.centerline_length,
+            main_funnel.warnings,
+        )
+    if imported_fan is not None:
+        fan_mesh = place_fan(
+            imported_fan.mesh,
+            imported_fan.hole_center,
+            imported_fan.z_min,
+            funnel,
+            effective_overlap,
+        )
+    else:
+        assert fan_config is not None
+        local_fan = make_custom_fan(fan_config)
+        fan_mesh = place_fan(
+            local_fan,
+            np.array([0.0, 0.0]),
+            0.0,
+            funnel,
+            effective_overlap,
+        )
+    return AssemblyParts(gpu_mesh, funnel.mesh, fan_mesh, funnel)
+
+
+def union_assembly(parts: AssemblyParts) -> trimesh.Trimesh:
+    try:
+        result = trimesh.boolean.union(parts.meshes, engine="manifold", check_volume=False)
+    except Exception as exc:  # pragma: no cover - backend messages vary
+        raise GeometryError(f"The assembly parts could not be fused: {exc}") from exc
+    if result is None:
+        raise GeometryError("The assembly parts could not be fused into one solid.")
+    if isinstance(result, trimesh.Scene):
+        result = result.to_mesh()
+    result.remove_unreferenced_vertices()
+    if not result.is_winding_consistent:
+        result.fix_normals()
+    if not result.is_watertight:
+        raise GeometryError("The fused assembly is not watertight and was not exported.")
+    if mesh_component_count(result) != 1:
+        raise GeometryError(
+            "The assembly contains disconnected solids. Increase contact or check the input STLs."
+        )
+    return result
+
+
+def mesh_component_count(mesh: trimesh.Trimesh) -> int:
+    """Count face-connected bodies without optional scipy/networkx dependencies."""
+    face_count = len(mesh.faces)
+    if face_count == 0:
+        return 0
+    parents = list(range(face_count))
+    ranks = [0] * face_count
+
+    def find(item: int) -> int:
+        while parents[item] != item:
+            parents[item] = parents[parents[item]]
+            item = parents[item]
+        return item
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        if ranks[left_root] < ranks[right_root]:
+            left_root, right_root = right_root, left_root
+        parents[right_root] = left_root
+        if ranks[left_root] == ranks[right_root]:
+            ranks[left_root] += 1
+
+    first_face_for_vertex: dict[int, int] = {}
+    for face_index, face in enumerate(mesh.faces):
+        for vertex in face:
+            vertex_index = int(vertex)
+            other = first_face_for_vertex.setdefault(vertex_index, face_index)
+            union(face_index, other)
+    return len({find(index) for index in range(face_count)})
+
+
+def export_stl(parts: AssemblyParts, path: str | Path) -> trimesh.Trimesh:
+    result = union_assembly(parts)
+    result.export(Path(path), file_type="stl")
+    return result

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#162a42"/>
+      <stop offset="1" stop-color="#0b1524"/>
+    </linearGradient>
+    <linearGradient id="duct" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#36c9bf"/>
+      <stop offset="1" stop-color="#167d82"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="46" fill="url(#bg)" stroke="#45627e" stroke-width="8"/>
+  <path d="M57 190 L72 109 C75 92 91 80 109 80 H147 C165 80 181 92 184 109 L199 190 Z"
+        fill="url(#duct)" stroke="#8cebe3" stroke-width="7" stroke-linejoin="round"/>
+  <circle cx="128" cy="74" r="49" fill="#101d2d" stroke="#f0a44f" stroke-width="10"/>
+  <circle cx="128" cy="74" r="13" fill="#f0a44f"/>
+  <path d="M128 61 C148 36 170 56 151 73 C143 80 133 82 128 82 Z" fill="#f0a44f"/>
+  <path d="M139 78 C164 98 144 120 127 101 C120 93 118 83 118 78 Z" fill="#f0a44f"/>
+  <path d="M124 86 C104 111 82 91 101 74 C109 67 119 65 124 65 Z" fill="#f0a44f"/>
+  <path d="M116 69 C91 49 111 27 128 46 C135 54 137 64 137 69 Z" fill="#f0a44f"/>
+  <rect x="45" y="184" width="166" height="30" rx="10" fill="#142338" stroke="#8cebe3" stroke-width="7"/>
+</svg>

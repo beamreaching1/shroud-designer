@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.py[cod]
+*.log
+*.egg-info/
+.DS_Store
+Thumbs.db
+build/
+dist/
+*-self-test*.json
+Shroud Designer Linux/
+public/

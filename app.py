@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+def resource_path(relative: str) -> Path:
+    """Resolve bundled data for frozen builds and source trees."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative
+    return Path(__file__).resolve().parent / relative
+
+
+def self_test(report_path: Path) -> int:
+    """Exercise packaged STL loading, generation, booleans, and native extensions."""
+    # Keep this path free of PySide6/OpenGL so frozen --self-test can run headless.
+    from shroud_designer.geometry import (
+        ConnectorStackConfig,
+        FanConfig,
+        FunnelConfig,
+        analyze_connector,
+        analyze_fan,
+        build_assembly_parts,
+        mesh_component_count,
+        union_assembly,
+    )
+
+    report: dict[str, object]
+    try:
+        connector = analyze_connector(
+            resource_path("GPU Connectors/cmp front.stl")
+        )
+        reference_fan = analyze_fan(
+            resource_path("Fans/default 120mm fan for shroud.stl")
+        )
+        straight = union_assembly(
+            build_assembly_parts(
+                connector,
+                FunnelConfig(length=50.0, offset_x=12.0, offset_y=-7.0),
+                fan_config=FanConfig(),
+            )
+        )
+        curved = union_assembly(
+            build_assembly_parts(
+                connector,
+                FunnelConfig(
+                    curved=True,
+                    angle_x=30.0,
+                    angle_y=-20.0,
+                    lead_in=25.0,
+                    lead_out=25.0,
+                    arc_diameter=60.0,
+                ),
+                imported_fan=reference_fan,
+            )
+        )
+        stacked = union_assembly(
+            build_assembly_parts(
+                connector,
+                FunnelConfig(length=40.0, split_distance=20.0),
+                fan_config=FanConfig(),
+                stack_config=ConnectorStackConfig(count=4, axis="y", spacing=5.0),
+            )
+        )
+        report = {
+            "ok": True,
+            "connector_opening_mm": [
+                round(connector.opening.width, 3),
+                round(connector.opening.depth, 3),
+            ],
+            "fan_opening_mm": round(reference_fan.hole_diameter, 3),
+            "straight": {
+                "watertight": bool(straight.is_watertight),
+                "components": mesh_component_count(straight),
+                "triangles": len(straight.faces),
+            },
+            "curved": {
+                "watertight": bool(curved.is_watertight),
+                "components": mesh_component_count(curved),
+                "triangles": len(curved.faces),
+            },
+            "stacked": {
+                "connector_count": 4,
+                "watertight": bool(stacked.is_watertight),
+                "components": mesh_component_count(stacked),
+                "triangles": len(stacked.faces),
+            },
+        }
+        code = 0
+    except Exception as exc:  # pragma: no cover - only used against packaged build
+        report = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        code = 1
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return code
+
+
+def _prepare_linux_gl() -> None:
+    """Prefer desktop GLX over EGL so QOpenGLWidget works with NVIDIA/X11."""
+    import os
+
+    if sys.platform != "linux":
+        return
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.environ.setdefault("QT_XCB_GL_INTEGRATION", "xcb_glx")
+    os.environ.setdefault("QT_OPENGL", "desktop")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
+
+
+def main() -> int:
+    if "--self-test" in sys.argv:
+        index = sys.argv.index("--self-test")
+        output = (
+            Path(sys.argv[index + 1])
+            if index + 1 < len(sys.argv)
+            else Path.cwd() / "shroud-designer-self-test.json"
+        )
+        return self_test(output)
+
+    _prepare_linux_gl()
+
+    from PySide6.QtGui import QSurfaceFormat
+    from PySide6.QtWidgets import QApplication
+
+    from shroud_designer.ui import APP_STYLESHEET, MainWindow, app_icon_path
+
+    surface = QSurfaceFormat()
+    surface.setVersion(2, 1)
+    surface.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
+    surface.setSamples(4)
+    surface.setDepthBufferSize(24)
+    QSurfaceFormat.setDefaultFormat(surface)
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Shroud Designer")
+    app.setOrganizationName("ShroudDesigner")
+    app.setStyle("Fusion")
+    app.setStyleSheet(APP_STYLESHEET)
+    icon = app_icon_path()
+    if icon.exists():
+        from PySide6.QtGui import QIcon
+
+        app.setWindowIcon(QIcon(str(icon)))
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

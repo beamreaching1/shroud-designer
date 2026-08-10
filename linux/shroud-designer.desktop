@@ -1,0 +1,14 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Shroud Designer
+GenericName=GPU shroud designer
+Comment=Turn a GPU connector STL into a print-ready airtight shroud
+Exec=ShroudDesigner
+Icon=shroud-designer
+Terminal=false
+Categories=Graphics;Engineering;3DGraphics;
+Keywords=GPU;shroud;STL;3D;fan;CAD;
+StartupNotify=true
+StartupWMClass=ShroudDesigner
