@@ -8,6 +8,7 @@ from typing import Iterable
 import numpy as np
 import trimesh
 import mapbox_earcut
+from shapely.affinity import rotate as rotate_polygon
 from shapely.affinity import translate as translate_polygon
 from shapely.geometry import Point, Polygon, box
 from shapely.geometry.polygon import orient
@@ -51,8 +52,28 @@ class FanAnalysis:
     hole_polygon: Polygon
     hole_center: np.ndarray
     hole_diameter: float
+    outer_polygon: Polygon
+    outer_center: np.ndarray
+    outer_diameter: float
     z_min: float
     z_max: float
+    use_outer_boundary: bool = False
+    rotation_angle: float = 0.0
+
+    @property
+    def active_polygon(self) -> Polygon:
+        """Return the polygon to use based on use_outer_boundary flag."""
+        return self.outer_polygon if self.use_outer_boundary else self.hole_polygon
+
+    @property
+    def active_center(self) -> np.ndarray:
+        """Return the center to use based on use_outer_boundary flag."""
+        return self.outer_center if self.use_outer_boundary else self.hole_center
+
+    @property
+    def active_diameter(self) -> float:
+        """Return the diameter to use based on use_outer_boundary flag."""
+        return self.outer_diameter if self.use_outer_boundary else self.hole_diameter
 
 
 @dataclass(slots=True)
@@ -297,15 +318,24 @@ def analyze_fan(path: str | Path) -> FanAnalysis:
 
     # The airflow opening is the largest hole. The smaller holes are fasteners.
     hole = holes[0]
-    center = hole.centroid
+    hole_center = hole.centroid
     min_x, min_y, max_x, max_y = hole.bounds
-    diameter = ((max_x - min_x) + (max_y - min_y)) / 2.0
+    hole_diameter = ((max_x - min_x) + (max_y - min_y)) / 2.0
+
+    # Calculate outer boundary info for use_outer_boundary option
+    outer_center = outer.centroid
+    outer_min_x, outer_min_y, outer_max_x, outer_max_y = outer.bounds
+    outer_diameter = ((outer_max_x - outer_min_x) + (outer_max_y - outer_min_y)) / 2.0
+
     return FanAnalysis(
         Path(path),
         mesh,
         hole,
-        np.array([center.x, center.y], dtype=float),
-        float(diameter),
+        np.array([hole_center.x, hole_center.y], dtype=float),
+        float(hole_diameter),
+        outer,
+        np.array([outer_center.x, outer_center.y], dtype=float),
+        float(outer_diameter),
         z_min,
         z_max,
     )
@@ -911,15 +941,39 @@ def build_assembly_parts(
         raise GeometryError("Choose either a custom fan connector or an imported fan STL.")
 
     if imported_fan is not None:
-        outlet_diameter = imported_fan.hole_diameter
+        outlet_diameter = imported_fan.active_diameter
         local_fan = imported_fan.mesh.copy()
-        local_hole_center = imported_fan.hole_center
+        local_hole_center = imported_fan.active_center
         local_z_min = imported_fan.z_min
-        fan_opening = translate_polygon(
-            imported_fan.hole_polygon,
-            xoff=-float(local_hole_center[0]),
-            yoff=-float(local_hole_center[1]),
-        )
+        
+        # Apply rotation if specified
+        if abs(imported_fan.rotation_angle) > 0.01:
+            # Rotate mesh around Z-axis at the active center
+            rotation_matrix = trimesh.transformations.rotation_matrix(
+                radians(imported_fan.rotation_angle),
+                [0, 0, 1],
+                point=[local_hole_center[0], local_hole_center[1], 0]
+            )
+            local_fan.apply_transform(rotation_matrix)
+            
+            # Rotate the polygon around its center
+            fan_opening = rotate_polygon(
+                imported_fan.active_polygon,
+                imported_fan.rotation_angle,
+                origin=(float(local_hole_center[0]), float(local_hole_center[1]))
+            )
+            # Then translate to origin
+            fan_opening = translate_polygon(
+                fan_opening,
+                xoff=-float(local_hole_center[0]),
+                yoff=-float(local_hole_center[1]),
+            )
+        else:
+            fan_opening = translate_polygon(
+                imported_fan.active_polygon,
+                xoff=-float(local_hole_center[0]),
+                yoff=-float(local_hole_center[1]),
+            )
     else:
         assert fan_config is not None
         outlet_diameter = fan_config.hole_diameter

@@ -7,6 +7,7 @@ from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QIcon, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -279,6 +280,24 @@ class MainWindow(QMainWindow):
         fan_file_row.addWidget(self.fan_browse)
         layout.addWidget(self.fan_file_widget)
 
+        self.use_outer_boundary = QCheckBox("Snap to bracket outline (not opening)")
+        self.use_outer_boundary.setToolTip(
+            "Use the outer boundary of the bracket instead of the detected fan opening. "
+            "Useful for dual-fan brackets where individual holes are detected separately."
+        )
+        layout.addWidget(self.use_outer_boundary)
+
+        self.fan_rotation_widget = QWidget()
+        fan_rotation_form = QFormLayout(self.fan_rotation_widget)
+        fan_rotation_form.setContentsMargins(0, 0, 0, 0)
+        self.fan_rotation = _spin(-180.0, 180.0, 0.0, suffix="°", decimals=1, step=5.0)
+        self.fan_rotation.setToolTip(
+            "Rotate the imported fan bracket around its Z-axis. "
+            "Useful for aligning dual-fan brackets or adjusting orientation."
+        )
+        fan_rotation_form.addRow("Rotation", self.fan_rotation)
+        layout.addWidget(self.fan_rotation_widget)
+
         self.custom_fan_widget = QWidget()
         custom_form = QFormLayout(self.custom_fan_widget)
         custom_form.setContentsMargins(0, 0, 0, 0)
@@ -398,6 +417,8 @@ class MainWindow(QMainWindow):
         self.fan_mode.currentIndexChanged.connect(self._fan_mode_changed)
         self.fan_size.currentIndexChanged.connect(self._fan_size_changed)
         self.funnel_mode.currentIndexChanged.connect(self._funnel_mode_changed)
+        self.use_outer_boundary.stateChanged.connect(self._outer_boundary_changed)
+        self.fan_rotation.valueChanged.connect(self._fan_rotation_changed)
         self.connector_count.valueChanged.connect(self._connector_layout_changed)
         self.stack_axis.currentIndexChanged.connect(self._connector_layout_changed)
         self.connector_spacing.valueChanged.connect(self._connector_layout_changed)
@@ -488,12 +509,25 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
         self.imported_fan = analysis
+        self.use_outer_boundary.setChecked(False)
+        self.fan_rotation.setValue(0.0)
         self.fan_path.setText(str(path))
         self.fan_path.setToolTip(str(path))
         self._update_fan_info()
         self.settings.setValue("fan_path", str(path))
         self.settings.setValue("last_folder", str(path.parent))
         self.schedule_preview()
+
+    def _outer_boundary_changed(self) -> None:
+        if self.imported_fan is not None:
+            self.imported_fan.use_outer_boundary = self.use_outer_boundary.isChecked()
+            self._update_fan_info()
+            self.schedule_preview()
+
+    def _fan_rotation_changed(self) -> None:
+        if self.imported_fan is not None:
+            self.imported_fan.rotation_angle = self.fan_rotation.value()
+            self.schedule_preview()
 
     def _opening_changed(self) -> None:
         if self.connector is None:
@@ -550,10 +584,18 @@ class MainWindow(QMainWindow):
         )
         if self.fan_mode.currentData() == "import" and self.imported_fan is not None:
             analysis = self.imported_fan
-            description = (
-                f"Detected {analysis.hole_diameter:.2f} mm opening • "
-                f"{analysis.z_max - analysis.z_min:.2f} mm thick"
-            )
+            if analysis.use_outer_boundary:
+                description = (
+                    f"Using outer boundary {analysis.outer_diameter:.2f} mm • "
+                    f"opening {analysis.hole_diameter:.2f} mm • "
+                    f"{analysis.z_max - analysis.z_min:.2f} mm thick"
+                )
+            else:
+                description = (
+                    f"Using opening {analysis.hole_diameter:.2f} mm • "
+                    f"outer {analysis.outer_diameter:.2f} mm • "
+                    f"{analysis.z_max - analysis.z_min:.2f} mm thick"
+                )
         else:
             size = float(self.fan_size.currentData())
             spacing = 124.5 if size == 140.0 else 105.0
@@ -567,6 +609,8 @@ class MainWindow(QMainWindow):
     def _update_mode_controls(self) -> None:
         imported = self.fan_mode.currentData() == "import"
         self.fan_file_widget.setVisible(imported)
+        self.use_outer_boundary.setVisible(imported)
+        self.fan_rotation_widget.setVisible(imported)
         self.custom_fan_widget.setEnabled(not imported)
         curved = bool(self.funnel_mode.currentData())
         self.straight_widget.setEnabled(not curved)
